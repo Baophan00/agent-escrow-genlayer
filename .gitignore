@@ -9,3 +9,6 @@ venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+node_modules/
+artifacts/
+scripts/.e2e-keys.json
