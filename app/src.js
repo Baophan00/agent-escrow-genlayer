@@ -3,7 +3,7 @@ import { studionet } from "genlayer-js/chains";
 
 const CONTRACT = "0x20bf078587ad95aa6F3f804de7D241a3cC5e2790";
 const EXPLORER = `https://explorer-studio.genlayer.com/address/${CONTRACT}`;
-const KEY_SLOT = "agentescrow.key";
+const KEY_SLOT = "agentescrow.keys";
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -22,8 +22,17 @@ function log(msg) {
   logTimer = setTimeout(() => (box.style.display = "none"), 6000);
 }
 
-let key = localStorage.getItem(KEY_SLOT) || "";
-let account = key ? createAccount(key) : null;
+function loadKeys() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(KEY_SLOT) || "[]");
+    return Array.isArray(raw) ? raw.filter((k) => typeof k === "string" && k) : [];
+  } catch {
+    return [];
+  }
+}
+let keys = loadKeys();
+let active = 0;
+let account = keys.length ? createAccount(keys[0]) : null;
 let me = account ? String(account.address) : "";
 const reader = createClient({ chain: studionet, account: createAccount(generatePrivateKey()) });
 
@@ -35,32 +44,63 @@ $("contractlink").textContent = short(CONTRACT);
 $("contractlink").href = EXPLORER;
 
 function paintKey() {
+  const sel = $("acting");
+  sel.replaceChildren();
+  if (!keys.length) {
+    const o = el("option", "", "no key");
+    o.value = "";
+    sel.append(o);
+  }
+  keys.forEach((k, i) => {
+    const o = el("option", "", `key ${i + 1} · ${short(String(createAccount(k).address))}`);
+    o.value = String(i);
+    sel.append(o);
+  });
+  sel.value = String(active);
   $("addr").textContent = me || "no key yet";
   $("walletchip").textContent = me ? `You ${short(me)}` : "No key";
 }
 
-$("genkey").onclick = () => {
-  key = generatePrivateKey();
-  localStorage.setItem(KEY_SLOT, key);
-  account = createAccount(key);
-  me = String(account.address);
+function saveKeys() {
+  localStorage.setItem(KEY_SLOT, JSON.stringify(keys));
+}
+
+function actAs(i) {
+  active = i;
+  account = keys[i] ? createAccount(keys[i]) : null;
+  me = account ? String(account.address) : "";
   paintKey();
-  log("New key. Copy the address if you need it as a seller.");
+  refresh();
+}
+
+$("acting").onchange = (e) => actAs(Number(e.target.value));
+
+$("genkey").onclick = () => {
+  keys.push(generatePrivateKey());
+  saveKeys();
+  actAs(keys.length - 1);
+  log("Key added. Fill the seller field with the other key to run both sides.");
 };
 
 $("importkey").onclick = () => {
   const v = prompt("Private key (0x…). Stays in this browser.");
   if (!v) return;
   try {
-    account = createAccount(v.trim());
-    me = String(account.address);
-    key = v.trim();
-    localStorage.setItem(KEY_SLOT, key);
-    paintKey();
+    createAccount(v.trim());
+    keys.push(v.trim());
+    saveKeys();
+    actAs(keys.length - 1);
     log("Key loaded.");
   } catch (e) {
     log("That key could not be read.");
   }
+};
+
+$("useseller").onclick = (ev) => {
+  ev.preventDefault();
+  const other = keys.find((k, i) => i !== active);
+  if (!other) return log("Add a second key first.");
+  $("f-seller").value = String(createAccount(other).address);
 };
 
 async function read(functionName, args = []) {

@@ -87,18 +87,20 @@
       <div class="card" style="margin-bottom:14px">
         <h2>Your key</h2>
         <p class="sub">Held in this browser only. Studio Network is a test network, never put real funds behind a key you paste here.</p>
-        <div class="mono" id="addr" style="word-break:break-all;font-size:12px;color:#3d4a5c">no key yet</div>
+        <label for="acting">Acting as</label>
+        <select id="acting"></select>
+        <div class="mono" id="addr" style="word-break:break-all;font-size:12px;color:#3d4a5c;margin-top:8px">no key yet</div>
         <div class="actions">
-          <button class="small" id="genkey">Generate key</button>
+          <button class="small" id="genkey">Add a key</button>
           <button class="small" id="importkey">Import key</button>
         </div>
-        <div class="hint">Writes are gasless on Studio. Reads work without a key.</div>
+        <div class="hint">Two keys is enough to walk the whole path alone: one buyer, one seller. Writes are gasless on Studio.</div>
       </div>
 
       <div class="card">
         <h2>New escrow</h2>
         <p class="sub">You are the buyer. The amount can stay at 0: the escrow then holds no money and only settles the dispute.</p>
-        <label for="f-seller">Seller address</label>
+        <label for="f-seller">Seller address <a href="#" id="useseller" style="font-size:12px">use my other key</a></label>
         <input id="f-seller" class="mono" placeholder="0x…" />
         <label for="f-title">Title</label>
         <input id="f-title" placeholder="10 product photos, 2000px wide" />
