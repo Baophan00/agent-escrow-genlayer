@@ -19,8 +19,8 @@ has to agree before anything is paid out.
 ## Live
 
 - App: https://agentescrow-genlayer.surge.sh
-- Contract (Studio Network): `0x20bf078587ad95aa6F3f804de7D241a3cC5e2790`
-- Explorer: https://explorer-studio.genlayer.com/address/0x20bf078587ad95aa6F3f804de7D241a3cC5e2790
+- Contract (Studio Network): `0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D`
+- Explorer: https://explorer-studio.genlayer.com/address/0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D
 
 ## The flow
 
@@ -35,8 +35,27 @@ has to agree before anything is paid out.
    return one of `release`, `refund`, `split` with a reason. Payout and verdict land together.
 
 The buyer can `cancel` before delivery, and `reclaim` after the deadline if nothing was delivered.
-Every settled escrow updates a per-address reputation counter that other agents can read before
-they take a job.
+Both buttons are wired in the app: `Reclaim` shows up for the buyer once the deadline has passed and
+`Delivered` disappears for the seller at the same moment, so the console cannot offer a call the
+contract would reject. Every settled escrow updates a per-address reputation counter that other
+agents can read before they take a job.
+
+## Where the evidence is read
+
+`resolve` fetches the delivered page inside the equivalence-principle callback, not before it:
+
+```python
+def ask() -> str:                       # runs once for the leader, once per validator
+    evidence = read_delivery()          # gl.nondet.web.render(...)
+    ...
+
+agreed = gl.eq_principle.prompt_comparative(ask, principle=principle)
+```
+
+Fetching outside the callback would let the leader read the page once and hand the validators its
+conclusion, so a validator would agree about a page it never opened. Inside the callback every
+validator re-reads the URL during the consensus round and a verdict only lands when they converge
+on what they each fetched.
 
 ## Contract surface
 
@@ -65,8 +84,12 @@ npx esbuild app/src.js --bundle --minify --format=iife --platform=browser \
 ## Deploy the contract
 
 ```bash
-genlayer deploy --contract contracts/agent_escrow.py
+node scripts/deploy_studionet.js
 ```
+
+The script deploys with `genlayer-js` (no CLI needed), prints the address, then reads `stats()`
+back: a deploy whose `__init__` raised still gets a receipt, so the view is the real proof.
+`genlayer deploy --contract contracts/agent_escrow.py` works the same way if the CLI is installed.
 
 ## Run the end to end script
 
@@ -75,7 +98,11 @@ Two real keys, no mocks, against a deployed contract:
 ```bash
 node scripts/e2e_studionet.js 0x<contract> mismatch   # buyer refunded
 node scripts/e2e_studionet.js 0x<contract> match      # seller released
+node scripts/e2e_studionet.js 0x<contract> reclaim    # no delivery, buyer takes the money back
 ```
+
+`reclaim` creates an escrow with a 90 second deadline, waits it out, and asserts the escrow ends in
+`refunded` with the contract holding nothing.
 
 Every step waits for `FINALIZED`, not `ACCEPTED`. A write sent while the previous one is only
 accepted executes against the older state, which looks like "escrow not found" even though the id
@@ -83,10 +110,33 @@ exists.
 
 ## Tests
 
-`tests/direct` still targets the first draft of the contract and the direct-mode runner it needs
-(genvm `v0.3.0-rc7`) is no longer downloadable, so those tests do not run. They are kept for the
-record, not as a passing suite. The checks that do run against the live network are
-`scripts/e2e_studionet.js` (both scenarios) and the view methods on the explorer.
+Nine direct-mode tests run against the current `genlayer-test` SDK and the runner the contract header
+pins (`py-genlayer:1jb45aa…`), no network involved:
+
+```bash
+python -m pytest tests/direct -q     # 9 passed
+```
+
+Web pages and model answers are mocked by the SDK, so the suite covers the whole lifecycle offline:
+fund and cancel, deliver and confirm, reclaim before and after the deadline (the clock is warped),
+role checks, and the settlement branch that pays out in the same write.
+
+Two of them cover the consensus callback specifically. `resolve` runs the leader, then
+`direct_vm.run_validator()` replays the callback the way a validator would. The page served through
+`_live_web_handler` is swapped between the two runs:
+
+- `test_validator_fetches_the_page_inside_the_consensus_callback` — leader reads page one and the
+  verdict is `refund`; the seller fixes the page; the validator run fetches a second time (the
+  handler records two hits) and disagrees, so `run_validator()` returns `False`.
+- `test_validator_agrees_when_the_page_is_unchanged` — same page both times, validator fetches
+  again and agrees.
+
+Pointed at the pre-fix contract, the first test fails with `fetches == 1` and `agreed == True`: the
+validator never opened the page and inherited the leader's verdict. That is the failure mode the two
+tests exist to catch.
+
+Against the live network, `scripts/e2e_studionet.js` still runs all three scenarios, and every step
+waits for `FINALIZED`.
 
 ## Notes from building it
 

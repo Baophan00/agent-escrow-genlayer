@@ -1,7 +1,7 @@
 import { createClient, createAccount, generatePrivateKey } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 
-const CONTRACT = "0x20bf078587ad95aa6F3f804de7D241a3cC5e2790";
+const CONTRACT = "0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D";
 const EXPLORER = `https://explorer-studio.genlayer.com/address/${CONTRACT}`;
 const KEY_SLOT = "agentescrow.keys";
 
@@ -181,13 +181,17 @@ function renderEscrow(e) {
 
   const isBuyer = me && me.toLowerCase() === String(e.buyer).toLowerCase();
   const isSeller = me && me.toLowerCase() === String(e.seller).toLowerCase();
+  const expired = Number(e.deadline) > 0 && Date.now() / 1000 > Number(e.deadline);
   const acts = el("div", "actions");
   const id = e.id;
 
   if (isBuyer && (e.state === "open" || e.state === "funded")) {
     acts.append(actionButton("Cancel", () => send("cancel", [id])));
   }
-  if (isSeller && (e.state === "open" || e.state === "funded")) {
+  if (isBuyer && (e.state === "open" || e.state === "funded") && expired) {
+    acts.append(actionButton("Reclaim", () => send("reclaim", [id]), true));
+  }
+  if (isSeller && (e.state === "open" || e.state === "funded") && !expired) {
     acts.append(actionButton("Delivered", async () => {
       const url = prompt("Public URL that proves the work");
       if (!url) return;
@@ -254,7 +258,8 @@ $("create").onclick = async () => {
     if (!/^0x[0-9a-fA-F]{40}$/.test(seller)) throw new Error("Seller address looks wrong.");
     if (!title || !terms) throw new Error("Title and terms are required.");
     const minutes = Math.max(1, Number($("f-deadline").value || 1440));
-    const review = Math.max(30, Number($("f-review").value || 120));
+    // The contract rejects anything under 60 seconds, so do not offer it.
+    const review = Math.max(60, Number($("f-review").value || 120));
     const gen = Number($("f-amount").value || 0);
     const value = BigInt(Math.round(gen * 1e18));
     const deadline = Math.floor(Date.now() / 1000) + minutes * 60;

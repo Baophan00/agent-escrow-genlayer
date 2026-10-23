@@ -307,20 +307,29 @@ class AgentEscrow(gl.Contract):
     def _judge(self, escrow: Escrow) -> dict:
         """Read the evidence and agree on who is right.
 
-        The delivered page is untrusted input: a seller can put anything in it,
-        including instructions addressed to the model. It is fenced, summarised
-        as data, and the model is told to never follow it. The comparison itself
-        runs through the equivalence principle, so a verdict only lands when the
+        The delivered page is fetched *inside* the non-deterministic block, so
+        the leader and every validator each read the page themselves during the
+        consensus round. Fetching before the block would mean the validators
+        compare conclusions about a page only the leader ever saw.
+
+        The page is untrusted input: a seller can put anything in it, including
+        instructions addressed to the model. It is fenced, summarised as data,
+        and the model is told to never follow it. The comparison itself runs
+        through the equivalence principle, so a verdict only lands when the
         validators converge on the same answer.
         """
-        evidence = ""
-        if escrow.delivery_url:
+
+        def read_delivery() -> str:
+            if not escrow.delivery_url:
+                return ""
             try:
-                evidence = gl.nondet.web.render(escrow.delivery_url, mode="text")[:MAX_PAGE_CHARS]
+                return gl.nondet.web.render(escrow.delivery_url, mode="text")[:MAX_PAGE_CHARS]
             except Exception:
-                evidence = "(the delivered url could not be read)"
+                return "(the delivered url could not be read)"
 
         def ask() -> str:
+            # Runs once for the leader and once per validator.
+            evidence = read_delivery()
             prompt = f"""
 You are settling an escrow between two software agents. Decide only from the
 material below.

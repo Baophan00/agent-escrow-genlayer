@@ -8,7 +8,8 @@
  *
  *   node scripts/e2e_studionet.js <contractAddress> [scenario]
  *
- * scenario: "mismatch" (default) or "match"
+ * scenario: "mismatch" (default), "match", or "reclaim" (seller never
+ * delivers, the buyer takes the money back once the deadline passes)
  */
 const fs = require("fs");
 const path = require("path");
@@ -101,12 +102,40 @@ async function read(functionName, args) {
   const sellerAddr = sellerAccount.address;
   const id = `e2e-${Date.now()}`;
   const now = Math.floor(Date.now() / 1000);
-  const deadline = now + 3600;
+  // The reclaim scenario needs a deadline that actually passes during the run.
+  const deadline = now + (SCENARIO === "reclaim" ? 90 : 3600);
 
   console.log("contract", ADDRESS);
   console.log("buyer   ", buyerAddr);
   console.log("seller  ", sellerAddr);
   console.log("scenario", SCENARIO);
+
+  if (SCENARIO === "reclaim") {
+    await write(
+      buyer,
+      "create_escrow",
+      [id, sellerAddr, "Ten product photos for the launch page",
+       "Ten original photos of the product, 2000px wide, delivered as a public gallery.",
+       deadline, 60],
+      "buyer"
+    );
+    console.log(`\nno delivery this time; waiting for the deadline at ${new Date(deadline * 1000).toISOString()}`);
+    for (;;) {
+      const left = deadline + 8 - Math.floor(Date.now() / 1000);
+      if (left <= 0) break;
+      console.log(`  ${left}s left`);
+      await sleep(Math.min(left, 30) * 1000);
+    }
+    await write(buyer, "reclaim", [id], "buyer");
+    const escrow = await read("get_escrow", [id]);
+    console.log("\nreclaimed escrow");
+    console.log(JSON.stringify(escrow, null, 2));
+    console.log("\nstats");
+    console.log(JSON.stringify(await read("stats", []), null, 2));
+    if (escrow.state !== "refunded") throw new Error(`reclaim left the escrow in state ${escrow.state}`);
+    console.log("\nVERDICT: buyer took the money back after the deadline");
+    return;
+  }
 
   if (SCENARIO === "match") {
     await write(

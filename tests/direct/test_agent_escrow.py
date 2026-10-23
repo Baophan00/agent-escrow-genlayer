@@ -1,141 +1,249 @@
-"""Direct mode tests for AgentEscrow contract."""
+"""Direct-mode tests for AgentEscrow, run with the current genlayer-test SDK.
+
+    python -m pytest tests/direct -q
+
+The tests use the SDK's own nondeterministic harness: web and LLM calls are
+mocked, `resolve` runs the leader, and `direct_vm.run_validator()` replays the
+consensus callback the way a validator would, so the evidence each validator
+reads can be inspected instead of assumed.
+"""
+
+import json
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
-from genlayer import *
+
+CONTRACT = "contracts/agent_escrow.py"
+
+DELIVERED_PAGE = "FETCHED-PAGE deluxe-logo-pack: source files, 12 svg logos, license included"
+PLACEHOLDER_PAGE = "FETCHED-PAGE under construction, nothing uploaded yet"
 
 
-class TestAgentEscrow:
-    """Test agent escrow contract functionality."""
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
-    def test_create_escrow(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test creating an escrow."""
-        contract = direct_deploy("contracts/agent_escrow.py")
+
+def address(raw):
+    """Wrap the SDK address bytes the way calldata decoding does on chain."""
+    from genlayer import Address
+
+    return Address(raw)
+
+
+def deploy(direct_deploy):
+    return direct_deploy(CONTRACT)
+
+
+def create(contract, direct_vm, buyer, seller, escrow_id="esc-1", amount=1000, seconds=3600):
+    direct_vm.sender = buyer
+    direct_vm.value = amount
+    deadline = int(time.time()) + seconds
+    contract.create_escrow(
+        escrow_id,
+        address(seller),
+        "Logo pack",
+        "twelve vector logos, editable files",
+        deadline,
+        60,
+    )
+    direct_vm.value = 0
+    return escrow_id
+
+
+def delivered_and_disputed(contract, direct_vm, buyer, seller):
+    create(contract, direct_vm, buyer, seller)
+    direct_vm.sender = seller
+    contract.mark_delivered("esc-1", "https://seller.example/logo-pack", "all twelve files")
+    direct_vm.sender = buyer
+    contract.raise_dispute("esc-1", "the archive only has three logos")
+
+
+def mock_page(direct_vm, body):
+    direct_vm.mock_web(r"https://seller\.example/logo-pack", {"status": 200, "body": body})
+
+
+def mock_verdict(direct_vm, evidence_marker, verdict):
+    """Answer the judging prompt only when the fetched page carries the marker.
+
+    Two markers means the summary the model sees really does come from the page
+    that the caller fetched, not from a page fetched earlier.
+    """
+    direct_vm.mock_llm(
+        rf"(?s).*{evidence_marker}.*",
+        json.dumps({"verdict": verdict, "confidence": 90, "reason": f"page said {evidence_marker}"}),
+    )
+
+
+class TestEscrowFlow:
+    def test_create_funds_and_cancel_refunds(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        create(contract, direct_vm, direct_alice, direct_bob, amount=1000)
+
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "funded"
+        assert escrow["amount"] == "1000"
+        assert contract.stats()["held"] == "1000"
+
         direct_vm.sender = direct_alice
+        contract.cancel("esc-1")
 
-        # Create escrow with 1000 wei
-        escrow_id = contract.create_escrow(
-            escrow_id="test-1",
-            seller=direct_bob,
-            description="Generate 10 images of cats",
-            value=1000,
-        )
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "cancelled"
+        assert escrow["amount"] == "1000"
+        assert contract.stats()["held"] == "0"
 
-        assert escrow_id == "test-1"
+    def test_deliver_then_confirm_releases(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        create(contract, direct_vm, direct_alice, direct_bob)
 
-        # Check escrow details
-        details = contract.get_escrow("test-1")
-        assert details["state"] == "funded"
-        assert details["amount"] == "1000"
-
-    def test_mark_delivered_and_confirm(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test full flow: fund -> deliver -> confirm."""
-        contract = direct_deploy("contracts/agent_escrow.py")
-        
-        # Buyer creates escrow
-        direct_vm.sender = direct_alice
-        contract.create_escrow(
-            escrow_id="test-2",
-            seller=direct_bob,
-            description="Analyze sentiment of 100 tweets",
-            value=2000,
-        )
-
-        # Seller marks delivered
         direct_vm.sender = direct_bob
-        contract.mark_delivered(
-            escrow_id="test-2",
-            delivery_url="https://example.com/delivery",
-        )
+        contract.mark_delivered("esc-1", "https://seller.example/logo-pack", "all twelve files")
+        assert contract.get_escrow("esc-1")["state"] == "delivered"
 
-        details = contract.get_escrow("test-2")
-        assert details["state"] == "delivered"
-
-        # Buyer confirms
         direct_vm.sender = direct_alice
-        contract.confirm_delivery("test-2")
+        contract.confirm_delivery("esc-1")
 
-        details = contract.get_escrow("test-2")
-        assert details["state"] == "resolved"
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "released"
+        assert escrow["verdict"] == "release"
+        assert contract.reputation(address(direct_bob))["settled"] == "1"
 
-    def test_dispute_flow(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test dispute resolution flow."""
-        contract = direct_deploy("contracts/agent_escrow.py")
-        
-        # Setup escrow
+    def test_only_seller_can_mark_delivered(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        create(contract, direct_vm, direct_alice, direct_bob)
+
         direct_vm.sender = direct_alice
-        contract.create_escrow(
-            escrow_id="test-3",
-            seller=direct_bob,
-            description="Write blog post about AI",
-            value=3000,
-        )
+        with direct_vm.expect_revert("only the seller"):
+            contract.mark_delivered("esc-1", "https://seller.example/logo-pack", "mine now")
 
-        # Seller delivers
+
+class TestReclaim:
+    def test_reclaim_after_the_deadline_refunds_the_buyer(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        start = int(time.time())
+        create(contract, direct_vm, direct_alice, direct_bob, seconds=3600)
+
+        direct_vm.warp(iso(start + 7200))
+        direct_vm.sender = direct_alice
+        contract.reclaim("esc-1")
+
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "refunded"
+        assert escrow["verdict"] == "refund"
+        assert "did not deliver before the deadline" in escrow["verdict_reason"]
+        assert contract.stats()["held"] == "0"
+
+    def test_reclaim_before_the_deadline_is_rejected(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        create(contract, direct_vm, direct_alice, direct_bob, seconds=3600)
+
+        direct_vm.sender = direct_alice
+        with direct_vm.expect_revert("deadline has not passed yet"):
+            contract.reclaim("esc-1")
+
+        assert contract.get_escrow("esc-1")["state"] == "funded"
+
+    def test_only_the_buyer_can_reclaim(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        start = int(time.time())
+        create(contract, direct_vm, direct_alice, direct_bob, seconds=3600)
+
+        direct_vm.warp(iso(start + 7200))
         direct_vm.sender = direct_bob
-        contract.mark_delivered(
-            escrow_id="test-3",
-            delivery_url="https://example.com/blog",
-        )
+        with direct_vm.expect_revert("only the buyer can reclaim"):
+            contract.reclaim("esc-1")
 
-        # Buyer disputes
-        direct_vm.sender = direct_alice
-        contract.raise_dispute("test-3")
 
-        details = contract.get_escrow("test-3")
-        assert details["state"] == "disputed"
+class TestValidatorEvidence:
+    """The delivery page must be read by every validator, not by the leader only."""
 
-        # Mock web for resolution
-        direct_vm.mock_web(
-            r".*example\.com.*",
-            {
-                "status": 200,
-                "body": "This is a comprehensive blog post about artificial intelligence...",
-            },
-        )
-        direct_vm.mock_llm(
-            r".*Verify if the delivered.*",
-            '{"matches_request": true, "quality": "good", "reason": "Content matches requested topic"}',
-        )
+    @staticmethod
+    def _agree_on_verdicts(direct_vm):
+        """Stand in for the EqComparative prompt GenVM asks the validators for."""
 
-        # Resolve dispute
-        result = contract.resolve_dispute("test-3")
-        assert result == "seller_wins"
+        def hook(vm, request):
+            template = request.get("ExecPromptTemplate")
+            if template is None:
+                return None
+            leader = json.loads(template["leader_answer"])
+            validator = json.loads(template["validator_answer"])
+            return {"ok": leader["verdict"] == validator["verdict"]}
 
-    def test_unauthorized_access(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test that only authorized users can perform actions."""
-        contract = direct_deploy("contracts/agent_escrow.py")
-        
-        direct_vm.sender = direct_alice
-        contract.create_escrow(
-            escrow_id="test-4",
-            seller=direct_bob,
-            description="Test service",
-            value=1000,
-        )
+        direct_vm._gl_call_hook = hook
 
-        # Bob cannot confirm his own delivery (only buyer can)
-        direct_vm.sender = direct_bob
-        with direct_vm.expect_revert("Only buyer can confirm"):
-            contract.confirm_delivery("test-4")
+    def test_validator_fetches_the_page_inside_the_consensus_callback(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
 
-    def test_get_buyer_escrows(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test listing buyer's escrows."""
-        contract = direct_deploy("contracts/agent_escrow.py")
-        direct_vm.sender = direct_alice
+        fetches = []
+        page = {"body": PLACEHOLDER_PAGE}
 
-        contract.create_escrow("e1", direct_bob, "Service 1", value=100)
-        contract.create_escrow("e2", direct_bob, "Service 2", value=200)
+        def serve(request):
+            fetches.append(request["url"])
+            return {"ok": {"response": {"status": 200, "body": page["body"].encode()}}}
 
-        escrows = contract.get_buyer_escrows(direct_alice)
-        assert "e1" in escrows
-        assert "e2" in escrows
+        direct_vm._live_web_handler = serve
+        mock_verdict(direct_vm, "under construction", "refund")
+        self._agree_on_verdicts(direct_vm)
 
-    def test_duplicate_escrow_id(self, direct_vm, direct_deploy, direct_alice, direct_bob):
-        """Test that duplicate escrow IDs are rejected."""
-        contract = direct_deploy("contracts/agent_escrow.py")
-        direct_vm.sender = direct_alice
+        # Leader round: one fetch, verdict refund.
+        result = contract.resolve("esc-1")
+        assert result["verdict"] == "refund"
+        assert contract.get_escrow("esc-1")["state"] == "refunded"
+        assert len(fetches) == 1
 
-        contract.create_escrow("dup", direct_bob, "Service", value=100)
+        # The seller fixes the page between the leader round and the validator
+        # round. A validator that reused the leader's page would still agree.
+        page["body"] = DELIVERED_PAGE
+        mock_verdict(direct_vm, "FETCHED-PAGE deluxe-logo-pack", "release")
 
-        with direct_vm.expect_revert("Escrow already exists"):
-            contract.create_escrow("dup", direct_bob, "Another", value=200)
+        agreed = direct_vm.run_validator()
+
+        assert len(fetches) == 2, "the validator did not read the delivery page itself"
+        assert fetches[0] == fetches[1] == "https://seller.example/logo-pack"
+        assert agreed is False, "validator agreed without reading the changed page"
+
+    def test_validator_agrees_when_the_page_is_unchanged(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
+
+        fetches = []
+
+        def serve(request):
+            fetches.append(request["url"])
+            return {"ok": {"response": {"status": 200, "body": DELIVERED_PAGE.encode()}}}
+
+        direct_vm._live_web_handler = serve
+        mock_verdict(direct_vm, "FETCHED-PAGE deluxe-logo-pack", "release")
+        self._agree_on_verdicts(direct_vm)
+
+        result = contract.resolve("esc-1")
+        assert result["verdict"] == "release"
+        assert len(fetches) == 1
+
+        agreed = direct_vm.run_validator()
+
+        assert len(fetches) == 2
+        assert agreed is True
+
+    def test_verdict_pays_out_in_the_same_write(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = deploy(direct_deploy)
+        delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
+
+        mock_page(direct_vm, DELIVERED_PAGE)
+        mock_verdict(direct_vm, "FETCHED-PAGE deluxe-logo-pack", "split")
+
+        contract.resolve("esc-1")
+
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "split"
+        assert escrow["closed_at"] != "0"
+        assert contract.stats()["held"] == "0"
+        assert contract.reputation(address(direct_bob))["settled"] == "1"
