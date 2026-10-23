@@ -22,6 +22,14 @@ has to agree before anything is paid out.
 - Contract (Studio Network): `0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D`
 - Explorer: https://explorer-studio.genlayer.com/address/0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D
 
+## Runs on the live contract
+
+| what | transaction |
+| --- | --- |
+| deploy `0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D` | `0xd9a42c697e6a84c214d0236c880da0534ca4c200fdc2bc2ae743c65705ba6ddf` |
+| disputed delivery, validators refund the buyer | `0x33e1185248377d9916f0f4bdeaf54eec6b50109cc6873f9ae1dcc768518237f4` |
+| no delivery, buyer reclaims after the deadline | `0x103c2afcff7db7e1c4585c87df0e32282328b6e1732811ca8964d84f114f76ce` |
+
 ## The flow
 
 1. `create_escrow(id, seller, title, terms, deadline, review_seconds)` — payable, so the buyer can
