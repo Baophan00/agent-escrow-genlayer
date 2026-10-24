@@ -34,6 +34,10 @@ OPEN = "open"
 FUNDED = "funded"
 DELIVERED = "delivered"
 DISPUTED = "disputed"
+# A verdict is not a payout any more: the validator set proposes a settlement,
+# the losing side gets one chance to appeal it, and only then does money move.
+PROPOSED = "proposed"
+APPEALED = "appealed"
 RELEASED = "released"
 REFUNDED = "refunded"
 SPLIT = "split"
@@ -45,6 +49,10 @@ MAX_URL = 600
 MAX_NOTE = 1200
 MAX_PAGE_CHARS = 6000
 MIN_REVIEW_SECONDS = 60
+# One hour for the losing side to appeal a verdict. Short enough that a buyer
+# is not left waiting on a stalled escrow, long enough that an agent which
+# sleeps between polls still sees the verdict before the window shuts.
+APPEAL_SECONDS = 3600
 
 
 @allow_storage
@@ -67,6 +75,14 @@ class Escrow:
     seller_response: str
     verdict: str
     verdict_reason: str
+    # Appeal round bookkeeping: when the verdict landed, when the appeal window
+    # shuts, who appealed and what they said, and which round produced the
+    # verdict currently stored.
+    proposed_at: u256
+    appeal_deadline: u256
+    appeal_by: str
+    appeal_note: str
+    round: u256
     created_at: u256
     delivered_at: u256
     disputed_at: u256
@@ -110,6 +126,27 @@ class AgentEscrow(gl.Contract):
         if amount == u256(0):
             return
         _Payee(to).emit_transfer(value=amount)
+
+    def _settle(self, escrow: Escrow, choice: str, reason: str) -> None:
+        """Move the money for a verdict that has become final.
+
+        Every path that ends an escrow goes through here, so the balance and the
+        books are written in the same transaction and cannot drift apart.
+        """
+        if choice == "release":
+            self._pay(Address(escrow.seller), escrow.amount)
+            self._bump(self.completed, Address(escrow.seller))
+            self._close(escrow, RELEASED, "release", reason)
+        elif choice == "split":
+            half = u256(int(escrow.amount) // 2)
+            self._pay(Address(escrow.seller), half)
+            self._pay(Address(escrow.buyer), escrow.amount - half)
+            self._bump(self.completed, Address(escrow.seller))
+            self._close(escrow, SPLIT, "split", reason)
+        else:
+            self._pay(Address(escrow.buyer), escrow.amount)
+            self._bump(self.refunded, Address(escrow.seller))
+            self._close(escrow, REFUNDED, "refund", reason)
 
     def _close(self, escrow: Escrow, state: str, verdict: str, reason: str) -> None:
         escrow.state = state
@@ -164,6 +201,11 @@ class AgentEscrow(gl.Contract):
             seller_response="",
             verdict="",
             verdict_reason="",
+            proposed_at=u256(0),
+            appeal_deadline=u256(0),
+            appeal_by="",
+            appeal_note="",
+            round=u256(0),
             created_at=now,
             delivered_at=u256(0),
             disputed_at=u256(0),
@@ -280,21 +322,20 @@ class AgentEscrow(gl.Contract):
         verdict = self._judge(escrow)
         choice = str(verdict.get("verdict", "")).lower()
         reason = str(verdict.get("reason", ""))[:400]
+        if choice not in ("release", "refund", "split"):
+            raise gl.vm.UserError("no usable verdict was reached")
 
-        if choice == "release":
-            self._pay(Address(escrow.seller), escrow.amount)
-            self._bump(self.completed, Address(escrow.seller))
-            self._close(escrow, RELEASED, "release", reason)
-        elif choice == "split":
-            half = u256(int(escrow.amount) // 2)
-            self._pay(Address(escrow.seller), half)
-            self._pay(Address(escrow.buyer), escrow.amount - half)
-            self._bump(self.completed, Address(escrow.seller))
-            self._close(escrow, SPLIT, "split", reason)
-        else:
-            self._pay(Address(escrow.buyer), escrow.amount)
-            self._bump(self.refunded, Address(escrow.seller))
-            self._close(escrow, REFUNDED, "refund", reason)
+        # Hold the money. The verdict is a proposal until the appeal window
+        # closes with no appeal: paying out here is what makes a single bad
+        # reading of a page final and unrecoverable.
+        escrow.state = PROPOSED
+        escrow.verdict = choice
+        escrow.verdict_reason = reason
+        escrow.round = u256(1)
+        escrow.proposed_at = self._now()
+        escrow.appeal_deadline = u256(int(escrow.proposed_at) + APPEAL_SECONDS)
+        escrow.closed_at = u256(0)
+        self._save(escrow)
 
         return {
             "verdict": escrow.verdict,
@@ -304,7 +345,7 @@ class AgentEscrow(gl.Contract):
 
     # ------------------------------------------------------------------ judging
 
-    def _judge(self, escrow: Escrow) -> dict:
+    def _judge(self, escrow: Escrow, appeal_note: str = "") -> dict:
         """Read the evidence and agree on who is right.
 
         The delivered page is fetched *inside* the non-deterministic block, so
@@ -327,6 +368,25 @@ class AgentEscrow(gl.Contract):
             except Exception:
                 return "(the delivered url could not be read)"
 
+        # Round two is not a fresh trial: the model is told what the first round
+        # decided and who objected to it, so an appeal has to argue with the
+        # earlier reading rather than be judged from scratch by a new set of
+        # validators who might simply land on a different coin toss.
+        if appeal_note:
+            prior_block = (
+                "THE FIRST ROUND OF VALIDATORS ALREADY RULED\n"
+                f"Verdict: {escrow.verdict}\n"
+                f"Reason: {escrow.verdict_reason}\n"
+                f"Appealed by: {escrow.appeal_by}\n"
+                f"Why the appeal says that is wrong: {appeal_note}\n\n"
+                "Confirm the earlier verdict or overturn it. Overturning needs the "
+                "appeal to identify something the first round got wrong about the "
+                "delivered work; disagreeing with the wording of the reason is not "
+                "enough."
+            )
+        else:
+            prior_block = ""
+
         def ask() -> str:
             # Runs once for the leader and once per validator.
             evidence = read_delivery()
@@ -347,6 +407,8 @@ Buyer: {escrow.dispute_reason}
 
 THE SELLER'S ANSWER
 {escrow.seller_response or "(no answer)"}
+
+{prior_block}
 
 CONTENT FETCHED FROM THE DELIVERY URL
 <<<UNTRUSTED_EVIDENCE
@@ -395,6 +457,67 @@ Answer as JSON only:
     def _bump(self, table, who: Address) -> None:
         table[who] = self._num(table, who) + u256(1)
 
+    @gl.public.write
+    def appeal(self, escrow_id: str, note: str) -> None:
+        """The losing side contests the verdict once, before the window shuts.
+
+        Only the two parties may appeal, only while the window is open, and only
+        once. The note is required: an appeal that says nothing gets the second
+        round nothing to work with, and the first round already looked at the
+        evidence.
+        """
+        escrow = self._load(escrow_id)
+        if escrow.state == APPEALED:
+            raise gl.vm.UserError("this verdict has already been appealed")
+        if escrow.state != PROPOSED:
+            raise gl.vm.UserError("there is no verdict to appeal")
+        sender = str(gl.message.sender_address)
+        if sender != escrow.buyer and sender != escrow.seller:
+            raise gl.vm.UserError("only the buyer or the seller can appeal")
+        if len(note) == 0 or len(note) > MAX_NOTE:
+            raise gl.vm.UserError("say why the verdict is wrong")
+        if int(self._now()) > int(escrow.appeal_deadline):
+            raise gl.vm.UserError("the appeal window has closed")
+        if int(escrow.round) != 1:
+            raise gl.vm.UserError("this verdict has already been appealed")
+
+        escrow.state = APPEALED
+        escrow.appeal_by = sender
+        escrow.appeal_note = note
+        escrow.round = u256(2)
+        self._save(escrow)
+
+    @gl.public.write
+    def resolve_appeal(self, escrow_id: str) -> dict:
+        """Second and final round. The validators see the first verdict too."""
+        escrow = self._load(escrow_id)
+        if escrow.state != APPEALED:
+            raise gl.vm.UserError("there is no appeal to rule on")
+
+        verdict = self._judge(escrow, appeal_note=escrow.appeal_note)
+        choice = str(verdict.get("verdict", "")).lower()
+        reason = str(verdict.get("reason", ""))[:400]
+        if choice not in ("release", "refund", "split"):
+            raise gl.vm.UserError("no usable verdict was reached")
+
+        escrow.verdict = choice
+        escrow.verdict_reason = reason
+        escrow.round = u256(2)
+        self._settle(escrow, choice, reason)
+        return {"verdict": escrow.verdict, "reason": escrow.verdict_reason, "state": escrow.state}
+
+    @gl.public.write
+    def finalize(self, escrow_id: str) -> None:
+        """Pay a verdict nobody appealed. Permissionless and LLM free."""
+        escrow = self._load(escrow_id)
+        if escrow.state == APPEALED:
+            raise gl.vm.UserError("the verdict is under appeal")
+        if escrow.state != PROPOSED:
+            raise gl.vm.UserError("there is no verdict to finalise")
+        if int(self._now()) < int(escrow.appeal_deadline):
+            raise gl.vm.UserError("the appeal window is still open")
+        self._settle(escrow, escrow.verdict, escrow.verdict_reason)
+
     # -------------------------------------------------------------------- views
 
     @gl.public.view
@@ -416,6 +539,11 @@ Answer as JSON only:
             "seller_response": e.seller_response,
             "verdict": e.verdict,
             "verdict_reason": e.verdict_reason,
+            "round": str(e.round),
+            "proposed_at": str(e.proposed_at),
+            "appeal_deadline": str(e.appeal_deadline),
+            "appeal_by": e.appeal_by,
+            "appeal_note": e.appeal_note,
             "created_at": str(e.created_at),
             "delivered_at": str(e.delivered_at),
             "disputed_at": str(e.disputed_at),
@@ -467,6 +595,8 @@ Answer as JSON only:
             FUNDED: 0,
             DELIVERED: 0,
             DISPUTED: 0,
+            PROPOSED: 0,
+            APPEALED: 0,
             RELEASED: 0,
             REFUNDED: 0,
             SPLIT: 0,
@@ -477,7 +607,7 @@ Answer as JSON only:
             e = self.escrows.get(escrow_id)
             if e is None:
                 continue
-            if e.state in (FUNDED, DELIVERED, DISPUTED):
+            if e.state in (FUNDED, DELIVERED, DISPUTED, PROPOSED, APPEALED):
                 held = held + e.amount
             if e.state in counts:
                 counts[e.state] += 1

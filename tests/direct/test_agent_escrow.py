@@ -192,7 +192,7 @@ class TestValidatorEvidence:
         # Leader round: one fetch, verdict refund.
         result = contract.resolve("esc-1")
         assert result["verdict"] == "refund"
-        assert contract.get_escrow("esc-1")["state"] == "refunded"
+        assert contract.get_escrow("esc-1")["state"] == "proposed"
         assert len(fetches) == 1
 
         # The seller fixes the page between the leader round and the validator
@@ -231,10 +231,11 @@ class TestValidatorEvidence:
         assert len(fetches) == 2
         assert agreed is True
 
-    def test_verdict_pays_out_in_the_same_write(
+    def test_verdict_holds_the_money_until_the_appeal_window_closes(
         self, direct_vm, direct_deploy, direct_alice, direct_bob
     ):
         contract = deploy(direct_deploy)
+        start = int(time.time())
         delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
 
         mock_page(direct_vm, DELIVERED_PAGE)
@@ -243,7 +244,124 @@ class TestValidatorEvidence:
         contract.resolve("esc-1")
 
         escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "proposed"
+        assert escrow["round"] == "1"
+        assert escrow["closed_at"] == "0"
+        assert contract.stats()["held"] == "1000", "the verdict paid out before the appeal window"
+        assert contract.reputation(address(direct_bob))["settled"] == "0"
+
+        direct_vm.warp(iso(start + 3700))
+        contract.finalize("esc-1")
+
+        escrow = contract.get_escrow("esc-1")
         assert escrow["state"] == "split"
         assert escrow["closed_at"] != "0"
         assert contract.stats()["held"] == "0"
         assert contract.reputation(address(direct_bob))["settled"] == "1"
+
+
+class TestAppeal:
+    def _proposed(self, direct_vm, direct_deploy, alice, bob, verdict="refund"):
+        contract = deploy(direct_deploy)
+        delivered_and_disputed(contract, direct_vm, alice, bob)
+        mock_page(direct_vm, PLACEHOLDER_PAGE)
+        mock_verdict(direct_vm, "under construction", verdict)
+        contract.resolve("esc-1")
+        return contract
+
+    def test_the_losing_side_can_appeal_once(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob)
+        assert contract.get_escrow("esc-1")["state"] == "proposed"
+
+        direct_vm.sender = direct_bob
+        contract.appeal("esc-1", "the page has the files behind one link")
+
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "appealed"
+        assert escrow["round"] == "2"
+        assert escrow["appeal_by"].lower() == str(address(direct_bob)).lower()
+        assert contract.stats()["held"] == "1000"
+
+        with direct_vm.expect_revert("already been appealed"):
+            contract.appeal("esc-1", "and another thing")
+
+    def test_an_outsider_cannot_appeal(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob)
+        direct_vm.sender = address("0x" + "11" * 20)
+        with direct_vm.expect_revert("only the buyer or the seller"):
+            contract.appeal("esc-1", "i want a say")
+
+    def test_an_appeal_needs_an_argument(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob)
+        direct_vm.sender = direct_bob
+        with direct_vm.expect_revert("say why the verdict is wrong"):
+            contract.appeal("esc-1", "")
+
+    def test_the_window_closes(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        start = int(time.time())
+        delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
+        mock_page(direct_vm, PLACEHOLDER_PAGE)
+        mock_verdict(direct_vm, "under construction", "refund")
+        contract.resolve("esc-1")
+
+        direct_vm.warp(iso(start + 3700))
+        direct_vm.sender = direct_bob
+        with direct_vm.expect_revert("appeal window has closed"):
+            contract.appeal("esc-1", "too late")
+
+        # Nobody appealed, so the proposal stands and anyone may settle it.
+        direct_vm.sender = address("0x" + "22" * 20)
+        contract.finalize("esc-1")
+        assert contract.get_escrow("esc-1")["state"] == "refunded"
+
+    def test_finalize_waits_for_the_window(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob)
+        with direct_vm.expect_revert("appeal window is still open"):
+            contract.finalize("esc-1")
+
+    def test_finalize_is_permissionless_and_llm_free(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = deploy(direct_deploy)
+        start = int(time.time())
+        delivered_and_disputed(contract, direct_vm, direct_alice, direct_bob)
+        mock_page(direct_vm, DELIVERED_PAGE)
+        mock_verdict(direct_vm, "FETCHED-PAGE deluxe-logo-pack", "release")
+        contract.resolve("esc-1")
+
+        direct_vm.warp(iso(start + 3700))
+        direct_vm.sender = address("0x" + "22" * 20)
+        contract.finalize("esc-1")
+
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "released"
+        assert contract.stats()["held"] == "0"
+
+    def test_the_second_round_can_overturn_the_first(
+        self, direct_vm, direct_deploy, direct_alice, direct_bob
+    ):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob, verdict="refund")
+
+        direct_vm.sender = direct_bob
+        contract.appeal("esc-1", "the audit trail is on the page, the buyer read the wrong one")
+
+        # The round-one mocks would match this prompt too, so drop them first.
+        direct_vm.clear_mocks()
+        mock_page(direct_vm, PLACEHOLDER_PAGE)
+        # Round two sees the first verdict in its prompt and lands elsewhere.
+        direct_vm.mock_llm(
+            r"(?s).*ALREADY RULED.*",
+            json.dumps({"verdict": "release", "confidence": 88, "reason": "the page does carry the files"}),
+        )
+        result = contract.resolve_appeal("esc-1")
+
+        assert result["verdict"] == "release"
+        escrow = contract.get_escrow("esc-1")
+        assert escrow["state"] == "released"
+        assert escrow["round"] == "2"
+        assert contract.stats()["held"] == "0"
+        assert contract.reputation(address(direct_bob))["settled"] == "1"
+
+    def test_resolve_appeal_needs_an_appeal(self, direct_vm, direct_deploy, direct_alice, direct_bob):
+        contract = self._proposed(direct_vm, direct_deploy, direct_alice, direct_bob)
+        with direct_vm.expect_revert("no appeal to rule on"):
+            contract.resolve_appeal("esc-1")

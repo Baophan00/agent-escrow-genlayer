@@ -182,25 +182,66 @@ async function read(functionName, args) {
   console.log("\nstate before the verdict");
   console.log(JSON.stringify(await read("get_escrow", [id]), null, 2));
 
-  console.log("\n[validator set] resolve");
+  console.log("\n[validator set] round 1: resolve");
   const t0 = Date.now();
   const hash = await buyer.writeContract({ address: ADDRESS, functionName: "resolve", args: [id], value: 0n });
   console.log(`  tx ${hash}`);
   const receipt = await wait(buyer, hash);
   console.log(`  ${receipt.status_name} after ${Math.round((Date.now() - t0) / 1000)}s`);
 
+  const proposed = await read("get_escrow", [id]);
+  const heldAfterRound1 = (await read("stats", [])).held;
+  console.log("\nround 1 escrow");
+  console.log(JSON.stringify(proposed, null, 2));
+  console.log("held after round 1:", heldAfterRound1);
+  if (proposed.state !== "proposed") {
+    throw new Error(`round 1 left the escrow in ${proposed.state}; the verdict must be held, not paid`);
+  }
+  // Studio net is gasless, so these keys hold nothing to stake: the escrow is
+  // created unfunded (state "open") and this run exercises the verdict, appeal
+  // and settlement state machine, not a transfer. The money-holding side is
+  // covered by the direct-mode tests, which fund the escrow.
+  const funded = Number(proposed.amount || 0) > 0;
+  console.log("escrow amount:", proposed.amount, funded ? "(funded)" : "(unfunded ruling)");
+  if (funded && String(heldAfterRound1) === "0") {
+    throw new Error("the verdict paid out before the appeal window: the money was released in round 1");
+  }
+
+  // The side the verdict went against is the one with a reason to appeal.
+  const appellant = proposed.verdict === "release" ? buyer : seller;
+  const appellantName = proposed.verdict === "release" ? "buyer" : "seller";
+  await write(
+    appellant,
+    "appeal",
+    [id, "The delivered page does carry the work; the first round read the placeholder instead of the gallery link."],
+    appellantName
+  );
+
+  const appealed = await read("get_escrow", [id]);
+  console.log("\nstate after appeal:", appealed.state, "| round:", appealed.round, "| held:", (await read("stats", [])).held);
+  if (appealed.state !== "appealed") throw new Error(`the appeal left the escrow in ${appealed.state}`);
+
+  console.log("\n[validator set] round 2: resolve_appeal");
+  const t1 = Date.now();
+  const appealHash = await buyer.writeContract({ address: ADDRESS, functionName: "resolve_appeal", args: [id], value: 0n });
+  console.log(`  tx ${appealHash}`);
+  const appealReceipt = await wait(buyer, appealHash);
+  console.log(`  ${appealReceipt.status_name} after ${Math.round((Date.now() - t1) / 1000)}s`);
+
   const final = await read("get_escrow", [id]);
   console.log("\nfinal escrow");
   console.log(JSON.stringify(final, null, 2));
   console.log("\nstats");
   console.log(JSON.stringify(await read("stats", []), null, 2));
-  if (final.state === "released") {
-    console.log("\nVERDICT: seller paid");
-  } else if (final.state === "split") {
-    console.log("\nVERDICT: split");
-  } else {
-    console.log("\nVERDICT: buyer refunded");
+
+  if (!["released", "refunded", "split"].includes(final.state)) {
+    throw new Error(`round 2 did not settle: state is ${final.state}`);
   }
+  if (final.round !== "2") throw new Error(`expected round 2, got ${final.round}`);
+  console.log("\n1st verdict:", proposed.verdict, "| final verdict:", final.verdict);
+  console.log(final.verdict === proposed.verdict
+    ? "\nAPPEAL: the second round confirmed the first verdict"
+    : "\nAPPEAL: the second round overturned the first verdict");
 })().catch((e) => {
   console.error("\nFAILED:", e.message);
   if (e.cause) console.error(String(e.cause).slice(0, 800));

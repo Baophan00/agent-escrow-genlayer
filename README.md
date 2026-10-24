@@ -19,16 +19,22 @@ has to agree before anything is paid out.
 ## Live
 
 - App: https://agentescrow-genlayer.surge.sh
-- Contract (Studio Network): `0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D`
-- Explorer: https://explorer-studio.genlayer.com/address/0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D
+- Contract (Studio Network): `0x07B89eDD3Ef2d913a31bBe6f2Ad2E7b7ebb4b9f5`
+- Explorer: https://explorer-studio.genlayer.com/address/0x07B89eDD3Ef2d913a31bBe6f2Ad2E7b7ebb4b9f5
 
 ## Runs on the live contract
 
 | what | transaction |
 | --- | --- |
-| deploy `0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D` | `0xd9a42c697e6a84c214d0236c880da0534ca4c200fdc2bc2ae743c65705ba6ddf` |
-| disputed delivery, validators refund the buyer | `0x33e1185248377d9916f0f4bdeaf54eec6b50109cc6873f9ae1dcc768518237f4` |
-| no delivery, buyer reclaims after the deadline | `0x103c2afcff7db7e1c4585c87df0e32282328b6e1732811ca8964d84f114f76ce` |
+| deploy `0x07B89eDD3Ef2d913a31bBe6f2Ad2E7b7ebb4b9f5` | `0xf4eb2df9b3814c9b5ab69686e91d0375abe2aab5a06c6afd46fcbba34c2699d1` |
+| round 1: validators propose `refund`, money stays held | `0xefc7f12d1e7788f86a3405f8794faecd0411b52b83ba790c4e8cc533954b344a` |
+| seller appeals the verdict | `0x5b1c0d479f3671c8301b043505b5f85f6d2e67421be858f563a1bae9c45aac73` |
+| round 2: validators confirm, escrow settles | `0x1344d18f2b993592eb0f63390a73f60c0f03c7e4d049b35230e9278c8223b54d` |
+
+The run behind the last three rows is `scripts/e2e_studionet.js` on the mismatch scenario: buyer funds
+nothing (Studio net is gasless), seller delivers `https://example.com`, buyer disputes, seller answers,
+round 1 returns `refund`, the seller appeals, round 2 confirms the verdict and settles. On the previous
+contract the same transaction paid the buyer in round 1 and there was nothing left to appeal.
 
 ## The flow
 
@@ -40,13 +46,38 @@ has to agree before anything is paid out.
 4. `raise_dispute(id, reason)` — buyer rejects the delivery.
 5. `respond(id, text)` — the seller gets one answer.
 6. `resolve(id)` — validators read the terms, the claim, the answer and the delivered page, then
-   return one of `release`, `refund`, `split` with a reason. Payout and verdict land together.
+   return one of `release`, `refund`, `split` with a reason. **The verdict is a proposal**: the money
+   stays in the contract and a one hour appeal window opens.
+7. `appeal(id, note)` — the side the verdict went against may contest it once, with a reason, while
+   the window is open. Nobody else can, and a second appeal is rejected.
+8. `resolve_appeal(id)` — a second consensus round. Its prompt carries the first verdict, its reason
+   and the appeal, and it may confirm or overturn. `finalize(id)` settles a verdict nobody appealed;
+   it is permissionless and needs no model call.
 
 The buyer can `cancel` before delivery, and `reclaim` after the deadline if nothing was delivered.
 Both buttons are wired in the app: `Reclaim` shows up for the buyer once the deadline has passed and
 `Delivered` disappears for the seller at the same moment, so the console cannot offer a call the
 contract would reject. Every settled escrow updates a per-address reputation counter that other
 agents can read before they take a job.
+
+## The appeal round
+
+A single consensus round is one reading of one page. The model can misread a gallery link as a
+placeholder, and a seller whose delivery was fine loses the money with no recourse. The appeal
+round is the fix, and it is deliberately narrow:
+
+- **The verdict does not pay.** `resolve` writes `proposed`, stores the verdict and opens a window;
+  `stats().held` keeps counting the money until a later transaction settles it. There is no code
+  path where a verdict and a transfer happen in the same call any more.
+- **One appeal, two parties.** Only the buyer or the seller, only while the window is open, only
+  once, and only with a written reason. An outsider is rejected, and so is an empty note.
+- **Round two argues with round one.** The second prompt contains the first verdict, its reason and
+  the appeal text, and the rules say overturning requires identifying something the first round got
+  wrong about the delivered work, not disagreeing with its wording. A fresh set of validators
+  re-reading the page from scratch would have been a coin toss between two equally plausible reads.
+- **Silence settles it.** `finalize` pays the stored verdict once the window shuts. It is
+  permissionless and makes no model call, so an escrow cannot be held hostage by an absent party and
+  a stalled escrow costs nothing to close.
 
 ## Where the evidence is read
 
@@ -118,16 +149,25 @@ exists.
 
 ## Tests
 
-Nine direct-mode tests run against the current `genlayer-test` SDK and the runner the contract header
-pins (`py-genlayer:1jb45aa…`), no network involved:
+Seventeen direct-mode tests run against the current `genlayer-test` SDK and the runner the contract
+header pins (`py-genlayer:1jb45aa…`), no network involved:
 
 ```bash
-python -m pytest tests/direct -q     # 9 passed
+python -m pytest tests/direct -q     # 17 passed
 ```
 
 Web pages and model answers are mocked by the SDK, so the suite covers the whole lifecycle offline:
 fund and cancel, deliver and confirm, reclaim before and after the deadline (the clock is warped),
-role checks, and the settlement branch that pays out in the same write.
+role checks, the appeal round, and the settlement branch.
+
+The appeal cases are the ones that would have passed silently on the old contract:
+`test_verdict_holds_the_money_until_the_appeal_window_closes` asserts `stats().held` is still the
+full amount after `resolve` and only drops after `finalize`; `test_the_losing_side_can_appeal_once`
+covers the single-appeal rule, `test_an_outsider_cannot_appeal` and `test_an_appeal_needs_an_argument`
+cover who may appeal and what they must say, `test_the_window_closes` and
+`test_finalize_waits_for_the_window` cover the clock, and
+`test_the_second_round_can_overturn_the_first` runs round two against the earlier verdict in its
+prompt and lands on a different answer.
 
 Two of them cover the consensus callback specifically. `resolve` runs the leader, then
 `direct_vm.run_validator()` replays the callback the way a validator would. The page served through

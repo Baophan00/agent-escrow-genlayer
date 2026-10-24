@@ -1,7 +1,7 @@
 import { createClient, createAccount, generatePrivateKey } from "genlayer-js";
 import { studionet } from "genlayer-js/chains";
 
-const CONTRACT = "0x5C4617747e1539b06038BfAc09aCE654D2E9fe9D";
+const CONTRACT = "0x07B89eDD3Ef2d913a31bBe6f2Ad2E7b7ebb4b9f5";
 const EXPLORER = `https://explorer-studio.genlayer.com/address/${CONTRACT}`;
 const KEY_SLOT = "agentescrow.keys";
 
@@ -124,6 +124,7 @@ async function send(functionName, args, value = 0n) {
 
 const STATE_LABEL = {
   open: "open", funded: "funded", delivered: "delivered", disputed: "disputed",
+  proposed: "verdict out", appealed: "appealed",
   released: "released", refunded: "refunded", split: "split", cancelled: "cancelled",
 };
 
@@ -174,10 +175,17 @@ function renderEscrow(e) {
 
   if (e.verdict) {
     const v = el("div", "verdict");
-    v.append(el("b", "", `Verdict: ${e.verdict}`));
+    const round = Number(e.round || 0);
+    v.append(el("b", "", `${round > 1 ? "Final verdict" : "Verdict"}: ${e.verdict}`));
     v.append(document.createTextNode(e.verdict_reason || ""));
     card.append(v);
   }
+  if (e.state === "proposed" || e.state === "appealed") {
+    const held = el("div", "kv");
+    held.append(el("span", "", `money held until ${when(e.appeal_deadline)}`));
+    card.append(held);
+  }
+  if (e.appeal_note) card.append(el("div", "kv", `appeal by ${short(e.appeal_by)}: ${e.appeal_note}`));
 
   const isBuyer = me && me.toLowerCase() === String(e.buyer).toLowerCase();
   const isSeller = me && me.toLowerCase() === String(e.seller).toLowerCase();
@@ -216,6 +224,20 @@ function renderEscrow(e) {
   }
   if (e.state === "disputed") {
     acts.append(actionButton("Ask validators", () => send("resolve", [id]), true));
+  }
+  const appealOpen = e.state === "proposed" && Date.now() / 1000 <= Number(e.appeal_deadline || 0);
+  if (appealOpen && (isBuyer || isSeller)) {
+    acts.append(actionButton("Appeal", async () => {
+      const why = prompt("What did the verdict get wrong? One or two sentences.");
+      if (!why) return;
+      await send("appeal", [id, why]);
+    }));
+  }
+  if (e.state === "proposed" && !appealOpen) {
+    acts.append(actionButton("Collect", () => send("finalize", [id]), true));
+  }
+  if (e.state === "appealed") {
+    acts.append(actionButton("Rule on appeal", () => send("resolve_appeal", [id]), true));
   }
   if (acts.children.length) card.append(acts);
   return card;
